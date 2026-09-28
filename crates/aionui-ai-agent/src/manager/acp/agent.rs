@@ -16,8 +16,8 @@ use crate::registry::CatalogSender;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionNotification,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, UsageUpdate,
+    AvailableCommand, CancelNotification, ExtRequest, ExtResponse, SessionConfigOptionCategory, SessionId,
+    SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest, UsageUpdate,
 };
 use aionui_api_types::{
     AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
@@ -1247,6 +1247,47 @@ impl AcpAgentManager {
     /// Whether the configured agent supports side questions.
     pub fn supports_side_question(&self) -> bool {
         self.params.metadata.behavior_policy.supports_side_question
+    }
+
+    /// 发送 ACP 扩展请求（extMethod）给 CLI 子进程。
+    ///
+    /// 用于调用 star CLI 等自定义 Agent 的 `sf/*` 扩展命令，
+    /// 如 `sf/captureSubmit`、`sf/feedbackSubmit` 等。
+    ///
+    /// `method` 不带前缀 `_`（协议层自动添加），
+    /// 如 `"sf/captureSubmit"` → 线上方法名 `_sf/captureSubmit`。
+    ///
+    /// `session_id` 为当前 ACP 会话 ID（来自 `session_id()`），
+    /// 省略时不附 sessionId（部分扩展命令不需要）。
+    pub async fn ext_request(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+    ) -> Result<Value, AgentError> {
+        let mut params_obj = serde_json::Map::new();
+        if let Some(sid) = session_id {
+            params_obj.insert("sessionId".to_string(), Value::String(sid.to_string()));
+        }
+        if let Value::Object(map) = params {
+            for (k, v) in map {
+                params_obj.insert(k, v);
+            }
+        } else {
+            params_obj.insert("params".to_string(), params);
+        }
+        let raw_params = serde_json::value::to_raw_value(&Value::Object(params_obj))
+            .map_err(|e| AgentError::Internal(format!("Failed to serialize ext params: {e}")))?;
+
+        let req = ExtRequest::new(method, Arc::from(raw_params));
+        let resp = self.protocol.ext_request(req).await.map_err(|e| {
+            AgentError::Internal(format!("ACP ext_request failed: {e}"))
+        })?;
+
+        // ExtResponse 内部是 Arc<RawValue>，反序列化为 Value 返回
+        let value: Value = serde_json::from_str(resp.0.get())
+            .map_err(|e| AgentError::Internal(format!("Failed to deserialize ext response: {e}")))?;
+        Ok(value)
     }
 }
 
