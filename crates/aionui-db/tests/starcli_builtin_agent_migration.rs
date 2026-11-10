@@ -82,10 +82,7 @@ async fn seeds_baseline_capabilities_and_leaves_unprobed_fields_null() {
         row.auth_methods, None,
         "auth_methods not probed yet; nothing is synthesized"
     );
-    assert_eq!(
-        row.yolo_id, None,
-        "yolo_id not confirmed by probe yet"
-    );
+    assert_eq!(row.yolo_id, None, "yolo_id not confirmed by probe yet");
     assert_eq!(
         row.native_skills_dirs, None,
         "no project-relative skills directory is documented"

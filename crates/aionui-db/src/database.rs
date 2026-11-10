@@ -405,22 +405,24 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", e))?;
 
-    let result = run_migrations_with_retry(&mut conn).await.map_err(|e| {
-        if let Some(db_version) = e.missing_migration_version() {
-            // Downgrade: the DB holds a migration this binary doesn't ship.
-            // warn (not error) — the database is intact; the app is just older
-            // than the data. Versions are needed at info+ to diagnose from
-            // production logs which release the user must return to.
-            warn!(
-                db_migration_version = db_version,
-                app_migration_version = latest_known_migration_version(),
-                "Database was created by a newer app version; refusing to open (downgrade detected)"
-            );
-            DatabaseInitError::new(DATABASE_NEWER_THAN_APP_STAGE, e)
-        } else {
-            DatabaseInitError::new("database.migration", e)
-        }
-    });
+    let result = run_migrations_with_retry(&mut conn, dev_migration_auto_fix_enabled())
+        .await
+        .map_err(|e| {
+            if let Some(db_version) = e.missing_migration_version() {
+                // Downgrade: the DB holds a migration this binary doesn't ship.
+                // warn (not error) — the database is intact; the app is just older
+                // than the data. Versions are needed at info+ to diagnose from
+                // production logs which release the user must return to.
+                warn!(
+                    db_migration_version = db_version,
+                    app_migration_version = latest_known_migration_version(),
+                    "Database was created by a newer app version; refusing to open (downgrade detected)"
+                );
+                DatabaseInitError::new(DATABASE_NEWER_THAN_APP_STAGE, e)
+            } else {
+                DatabaseInitError::new("database.migration", e)
+            }
+        });
 
     sqlx::query("PRAGMA foreign_keys = ON; PRAGMA legacy_alter_table = OFF")
         .execute(&mut *conn)
@@ -440,7 +442,10 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
 /// rolled back, so re-running `sqlx::migrate!().run` is safe: the second
 /// pass sees the row that the winner committed, checksum matches (same
 /// shipped binary), and the migration is treated as already applied.
-async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<(), DbError> {
+async fn run_migrations_with_retry(
+    conn: &mut sqlx::SqliteConnection,
+    dev_migration_auto_fix: bool,
+) -> Result<(), DbError> {
     match DB_MIGRATOR.run(&mut *conn).await {
         Ok(()) => Ok(()),
         Err(e) if is_migrations_table_unique_conflict(&e) => {
@@ -454,6 +459,20 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
                 warn!(
                     "Aligned checksum for reconciled MCP migration {}; retrying",
                     MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION
+                );
+                DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
+            } else {
+                Err(DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(
+                    version,
+                )))
+            }
+        }
+        Err(sqlx::migrate::MigrateError::VersionMismatch(version)) if dev_migration_auto_fix => {
+            let aligned = align_modified_migration_checksums(&mut *conn).await?;
+            if aligned > 0 {
+                warn!(
+                    "Dev migration auto-fix: aligned {} modified migration checksum(s); retrying",
+                    aligned
                 );
                 DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
             } else {
@@ -672,6 +691,51 @@ async fn align_reconciled_mcp_migration_checksum(conn: &mut sqlx::SqliteConnecti
     Ok(updated.rows_affected() > 0)
 }
 
+/// Read the `AIONCORE_DEV_MIGRATION_AUTO_FIX` opt-in flag.
+///
+/// When set to `1` (user-set environment variable), locally modified
+/// migration files whose checksum no longer matches the applied row are
+/// auto-realigned at startup instead of aborting. Off by default: production
+/// keeps sqlx's strict validation.
+fn dev_migration_auto_fix_enabled() -> bool {
+    std::env::var_os("AIONCORE_DEV_MIGRATION_AUTO_FIX").is_some_and(|v| v == "1")
+}
+
+/// Realign `_sqlx_migrations.checksum` for every already-applied row whose
+/// stored checksum differs from the binary's embedded value.
+///
+/// Only checksums are rewritten; migration SQL is never re-executed, so
+/// seed-data changes in the modified file are not reflected until a new
+/// numbered migration is added.
+async fn align_modified_migration_checksums(conn: &mut sqlx::SqliteConnection) -> Result<u64, DbError> {
+    let mut aligned = 0u64;
+    for migration in DB_MIGRATOR.iter() {
+        let stored: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ? AND success = 1")
+                .bind(migration.version)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(DbError::Query)?;
+
+        if let Some(stored) = stored
+            && stored.as_slice() != migration.checksum.as_ref()
+        {
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+                .bind(&*migration.checksum)
+                .bind(migration.version)
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::Query)?;
+            warn!(
+                version = migration.version,
+                "Dev migration auto-fix: realigned checksum of modified migration"
+            );
+            aligned += 1;
+        }
+    }
+    Ok(aligned)
+}
+
 /// Ensure the system default user exists.
 ///
 /// Uses INSERT OR IGNORE so it is safe to call on every startup.
@@ -865,5 +929,49 @@ mod tests {
     fn startup_file_retry_rejects_non_transient_errors() {
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing file");
         assert!(!is_retryable_startup_file_error(&err));
+    }
+
+    #[tokio::test]
+    async fn dev_migration_auto_fix_realigns_modified_checksums() {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool();
+
+        // Simulate a locally edited migration file: stored checksum drifts.
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 45")
+            .execute(pool)
+            .await
+            .unwrap();
+
+        // Strict mode still refuses to open.
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let err = run_migrations_with_retry(&mut conn, false)
+                .await
+                .expect_err("strict mode must keep refusing a modified migration");
+            assert!(
+                matches!(
+                    err,
+                    DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(45))
+                ),
+                "unexpected error: {err:?}"
+            );
+        }
+
+        // Dev mode realigns and retries to success.
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            run_migrations_with_retry(&mut conn, true)
+                .await
+                .expect("dev auto-fix should retry migrations successfully");
+            let stored: Vec<u8> = sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 45")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            let expected = DB_MIGRATOR
+                .iter()
+                .find(|m| m.version == 45)
+                .expect("migration 45 must be embedded in this binary");
+            assert_eq!(stored.as_slice(), expected.checksum.as_ref());
+        }
     }
 }
